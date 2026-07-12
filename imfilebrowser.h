@@ -194,7 +194,16 @@ inline ImGui::FileBrowser::FileBrowser(ImGuiFileBrowserFlags flags)
     inputNameBuf_->front() = '\0';
     inputNameBuf_->back() = '\0';
     SetTitle("file browser");
-    SetPwd(std::filesystem::current_path());
+    // On Android the process cwd is "/" which is not enumerable by an
+    // unprivileged app. std::filesystem::current_path() can also throw
+    // outright. Use a try/catch and fall back to "/" so the constructor
+    // never propagates a filesystem_error to the caller.
+    try {
+        SetPwd(std::filesystem::current_path());
+    } catch (...) {
+        try { SetPwd(std::filesystem::path("/")); }
+        catch (...) { /* swallow; pwd_ stays empty, Display() will show empty list */ }
+    }
 
     typeFilters_.clear();
     typeFilterIndex_ = 0;
@@ -390,7 +399,7 @@ inline void ImGui::FileBrowser::Display()
 #endif
 
     int secIdx = 0, newPwdLastSecIdx = -1;
-    for(auto &sec : pwd_)
+    for(auto const &sec : pwd_)
     {
 #ifdef _WIN32
         if(secIdx == 1)
@@ -418,7 +427,7 @@ inline void ImGui::FileBrowser::Display()
     {
         int i = 0;
         std::filesystem::path newPwd;
-        for(auto &sec : pwd_)
+        for(auto const &sec : pwd_)
         {
             if(i++ > newPwdLastSecIdx)
             {
@@ -699,7 +708,14 @@ inline bool ImGui::FileBrowser::SetPwd(const std::filesystem::path &pwd)
         statusStr_ = "last error: unknown";
     }
 
-    SetPwdUncatched(std::filesystem::current_path());
+    // Fallback chain: try cwd, then "/", then give up without throwing.
+    // The original code called SetPwdUncatched(current_path()) unwrapped,
+    // which crashed on Android (cwd "/" is not enumerable for an
+    // unprivileged app and current_path() itself can throw).
+    try { SetPwdUncatched(std::filesystem::current_path()); return false; }
+    catch (...) {}
+    try { SetPwdUncatched(std::filesystem::path("/")); }
+    catch (...) {}
     return false;
 }
 
@@ -838,33 +854,55 @@ inline void ImGui::FileBrowser::UpdateFileRecords()
 {
     fileRecords_ = { FileRecord{ true, "..", "[D] ..", "" } };
 
-    for(auto &p : std::filesystem::directory_iterator(pwd_))
-    {
-        FileRecord rcd;
+    // error_code-overload variant: never throws. Required on Android (cwd
+    // "/" is not listable by an unprivileged app — the throwing iterator
+    // would propagate filesystem_error and crash the activity). Failed
+    // entries are skipped silently, so a bad pwd_ just renders as an empty
+    // list with the parent ".." entry, which is what we want.
+    std::error_code ec;
+    auto it = std::filesystem::directory_iterator(
+        pwd_,
+        std::filesystem::directory_options::skip_permission_denied,
+        ec);
+    if (ec) {
+        std::sort(fileRecords_.begin(), fileRecords_.end(),
+            [](const FileRecord &L, const FileRecord &R)
+        {
+            return (L.isDir ^ R.isDir) ? L.isDir : (L.name < R.name);
+        });
+        return;
+    }
 
-        if(p.is_regular_file())
+    for(; it != std::filesystem::directory_iterator(); it.increment(ec))
+    {
+        if (ec) { ec.clear(); continue; }
+
+        FileRecord rcd;
+        if(it->is_regular_file(ec))
         {
             rcd.isDir = false;
         }
-        else if(p.is_directory())
+        else if(it->is_directory(ec))
         {
             rcd.isDir = true;
         }
         else
         {
+            ec.clear();
             continue;
         }
+        if (ec) { ec.clear(); continue; }
 
-        rcd.name = p.path().filename();
+        rcd.name = it->path().filename();
         if(rcd.name.empty())
         {
             continue;
         }
 
-        rcd.extension = p.path().filename().extension();
+        rcd.extension = it->path().filename().extension();
 
         rcd.showName = (rcd.isDir ? "[D] " : "[F] ") +
-                       u8StrToStr(p.path().filename().u8string());
+                       u8StrToStr(it->path().filename().u8string());
         fileRecords_.push_back(rcd);
     }
 
